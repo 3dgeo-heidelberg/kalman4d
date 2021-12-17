@@ -15,11 +15,13 @@ The following packages:
 - scikit-learn
 - filterpy
 - laspy<2.0.0
+- pdal
 
 The ICPmat2CxxMat.exe is a MatLAB executable to transfer the covariance information created by OPALS ICP (https://opals.geo.tuwien.ac.at/html/stable/ModuleICP.html) to a .mat-File that is readable by python/numpy.
 
 The tf_helper.py is a script to transform a 6x6 covariance matrix (rigid Helmert-Transform with fixed scale) to a full 12x12 covariance matrix as required by M3C2-EP.
 
+apply_filter.bat is a batch file applying the ground point filter used in pre-preparation of the data. It relies on PDAL.
 
 Running the scripts:
 --------------------
