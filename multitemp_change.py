@@ -187,7 +187,7 @@ def process_corepoint_list(corepoints, corepoint_normals,
             elif p2_curr_pts.shape[0] > M3C2Meta["maxneigh"]:
                 p2_curr_pts = p2_curr_pts[np.argsort(acrossSq2[:M3C2Meta['maxneigh']])]
                 p2_scanPos = p2_scanPos[np.argsort(acrossSq2[:M3C2Meta['maxneigh']])]
-            p2_CoG, p2_local_Cxx = get_local_mean_and_Cxx_nocorr(M3C2Meta, p2_curr_pts, p2_scanPos, epoch=1, tf=True)
+            p2_CoG, p2_local_Cxx = get_local_mean_and_Cxx_nocorr(M3C2Meta, p2_curr_pts, p2_scanPos, epoch=epoch_i, tf=True)
 
             p1_p2_CoG_Cxx = np.zeros((6, 6))
             p1_p2_CoG_Cxx[0:3, 0:3] = p1_local_Cxx
@@ -660,6 +660,9 @@ if __name__ == '__main__':
     for chunk in range(len(tiles_pre)//step + 1):
         print("Running for Epochs %s - %s (Chunk %s/%s)" % (1+chunk*step,(chunk+1)*step, chunk+1, len(tiles_pre)//step + 1))
         tiles_curr = [tiles_pre[0]] + tiles_pre[1+chunk*step:1+(chunk+1)*step]
+        if len(tiles_curr) == 1:
+            print("Empty chunk.")
+            break
         outFile = r"change_full_info_%02d.las" % chunk
         CxxFiles = [r"trafos\vals_" + ep.replace("_gnd.las", r"\Cxx.mat").replace(r"pointclouds_gnd\ScanPos001 - SINGLESCANS - ", "") for ep in tiles_curr[1:]]  # first one does not have any CXX
         p_dates = [datetime.strptime(ep.replace("_gnd.las","")[-13:],'%y%m%d_%H%M%S') for ep in tiles_curr]

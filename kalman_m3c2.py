@@ -134,7 +134,7 @@ def proc_cp(p_changes, p_unc, p_dates, corepoint_id, p_val, mkplot, Q_vals, expo
     p_unc_raw = p_unc
     p_unc = np.concatenate((p_unc_raw, ts_nones))
     p_unc = p_unc[meas_order]
-    dts = np.gradient(ts)
+    dts = np.diff(ts)
 
     zs = np.concatenate((p_changes, ts_nones))[meas_order]
     Fs = [np.array([[1., dt, 1/2*dt**2],
