@@ -1,10 +1,14 @@
-
+# from pykdtree.kdtree import KDTree  # not serializeable
+#from sklearn.neighbors import KDTree
+import laspy
+import pandas as pd
 from scipy import spatial
 import numpy as np
 import math
 import multiprocessing as mp
 import pickle
 import scipy.io as sio
+import scipy.stats as sstats
 import os
 from collections import namedtuple
 import re
@@ -12,9 +16,14 @@ from tqdm import tqdm
 import time
 import sys
 from datetime import datetime
+import matplotlib.pyplot as plt
+import tf_helper_T as tf_helper
 
-import tf_helper
+import scipy.stats as sstats
 
+p = 3  # three dimensional
+p_val = sstats.chi2.ppf(.95, p)
+#print("p_val", p_val)
 
 # from https://stackoverflow.com/questions/6451655/how-to-convert-python-datetime-dates-to-decimal-float-years
 def datetime2year(dt):
@@ -26,6 +35,12 @@ def datetime2year(dt):
     return dt.year + year_part / year_length
 
 np.seterr(divide='ignore', invalid='ignore')
+
+strip_name_finder = re.compile(r"^IdGridMov\[(.*?)\]$", flags=re.M)
+strip_name_finder_Fix = re.compile(r"^IdGridFix\[(.*?)\]$", flags=re.M)
+rPM_finder = re.compile(r"^RefPointMov\[(.*?)\]$", flags=re.M)
+rPF_finder = re.compile(r"^RefPointFix\[(.*?)\]$", flags=re.M)
+tfM_finder = re.compile(r"TrafPars\[(.*?)\]", flags=re.S)
 
 M3C2MetaInfo = namedtuple('M3C2MetaInfo', ('spInfos', 'tfM', 'Cxx', 'redPoint', 'searchrad', 'maxdist'))
 SPMetaInfo = namedtuple('SPMetaInfo', ('origin', 'sigma_range', 'sigma_yaw', 'sigma_scan', 'ppm'))
@@ -70,91 +85,74 @@ def getAlongAcrossSqBatch(pts, poa, n):
     return (alongs, across2)
 
 def read_from_las(path):
-    from laspy.file import File as LasFile
-    inFile = LasFile(path, mode='r')
+    inFile = laspy.read(path)
     coords = np.vstack((inFile.x, inFile.y, inFile.z)).transpose()
     try:
-        normals = getattr(inFile, 'normals', None)
+        n0 = inFile.points.array["NormalX"]
+        n1 = inFile.points.array["NormalY"]
+        n2 = inFile.points.array["NormalZ"]
+        normals = np.stack((n0,n1,n2)).T
     except:
         normals = None
-    if normals is None:
-        try:
-            n0 = inFile.points["point"]["NormalX"]
-            n1 = inFile.points["point"]["NormalY"]
-            n2 = inFile.points["point"]["NormalZ"]
-            normals = np.stack((n0,n1,n2)).T
-        except:
-            normals = None
-    print(path, "Normals: ", normals)
-    scanpos = getattr(inFile, 'pt_src_id', None)
 
-    if "amplitude" in inFile.points.dtype.fields["point"][0].fields:
-        amp = inFile.points["point"]["amplitude"]
-    elif "Amplitude" in inFile.points.dtype.fields["point"][0].fields:
-        amp = inFile.points["point"]["Amplitude"]
+    scanpos = inFile.points.array["point_source_id"]
+
+    extra_dims = list(inFile.points.point_format.extra_dimension_names)
+    if "Amplitude" in extra_dims:
+        amp = inFile.points.array["Amplitude"]
     else:
         amp = None
-    if "deviation" in inFile.points.dtype.fields["point"][0].fields:
-        dev = inFile.points["point"]["deviation"]
-    elif "Deviation" in inFile.points.dtype.fields["point"][0].fields:
-        dev = inFile.points["point"]["Deviation"]
+
+    if "Deviation" in extra_dims:
+        dev = inFile.points.array["Deviation"]
     else:
         dev = None
     return coords, normals, scanpos, amp, dev
 
-las_data_types = {
-    int: 4,
-    float: 10,  # or 10 for double prec
-    np.dtype(np.float64): 10,
-    np.dtype(np.int32): 4
-}
-
 def write_to_las(path, points, attrdict):
-    LasFile = None  # full reset
-    LasHeader = None
-    from laspy.file import File as LasFile
-    from laspy.header import Header as LasHeader
-    hdr = LasHeader(version_major=1, version_minor=4)
-    outFile = LasFile(path, mode="w", header=hdr)
+    # 1. Create a new header
+    header = laspy.LasHeader(point_format=3, version="1.2")
+
     for attrname in attrdict:
-        if attrname == "normals":
-            outFile.define_new_dimension(name=attrname, data_type=30, description=attrname)
-            continue
         try:
-            dt = 9 # default data type
-            if attrdict[attrname].dtype in las_data_types:
-                dt = las_data_types[attrdict[attrname].dtype]
-            else:
-                print("Unknown data type: '%s', attemping saving as float." % attrdict[attrname].dtype)
-            outFile.define_new_dimension(name=attrname.lower(), data_type=dt, description=attrname.lower())
+            dt = attrdict[attrname].dtype
+            header.add_extra_dim(laspy.ExtraBytesParams(name=attrname.lower(), type=dt, description=attrname.lower()))
         except Exception as e:
             print("Failed adding dimension %s: %s" % (attrname.lower(), e))
-    xmin, ymin, zmin = np.min(points, axis=0)
-    outFile.header.offset = [xmin, ymin, zmin]
-    outFile.header.scale = [0.001, 0.001, 0.001]
-    outFile.x = points[:, 0]
-    outFile.y = points[:, 1]
-    outFile.z = points[:, 2]
+    header.offsets = np.min(points, axis=0)
+    header.scales = np.array([0.00025, 0.00025, 0.00025])
+
+    # 2. Create a Las
+    las = laspy.LasData(header)
+
+    las.x = points[:, 0]
+    las.y = points[:, 1]
+    las.z = points[:, 2]
+
     for attrname in attrdict:
-        setattr(outFile, attrname.lower(), attrdict[attrname])
-    outFile.close()
-    outFile = None
+        setattr(las, attrname.lower(), attrdict[attrname])
+    las.write(path)
 
 
 def process_corepoint_list(corepoints, corepoint_normals,
                            p_idx, p_shm_names, p_sizes, p_positions, p_dates,
                            M3C2Meta, idx, return_dict, pbarQueue):
+    pbarQueue.put((0, 1))
     pj_shm = [mp.shared_memory.SharedMemory(name=pi_shm_name) for pi_shm_name in p_shm_names]
     p1_coords, *pi_coords = [np.ndarray(pi_size, dtype=np.float, buffer=pi_shm.buf) for (pi_size, pi_shm) in zip(p_sizes, pj_shm)]
     p1_positions, *pi_positions = p_positions
     p1_idx, *pi_idx = p_idx
-    pbarQueue.put((0, 1))  # point processing
 
     max_dist = M3C2Meta['maxdist']
     search_radius = M3C2Meta['searchrad']
 
     M3C2_vals = np.full((corepoints.shape[0], len(pi_coords)), np.nan, dtype=np.float64)
+    M3C2_vals_sig = np.full((corepoints.shape[0], len(pi_coords)), np.nan, dtype=np.float64)
+    M3C2_leg_vals = np.full((corepoints.shape[0], len(pi_coords)), np.nan, dtype=np.float64)
+    M3C2_leg_uncs = np.full((corepoints.shape[0], len(pi_coords)), np.nan, dtype=np.float64)
     M3C2_uncs = np.full((corepoints.shape[0], len(pi_coords)), np.nan, dtype=np.float64)
+    M3C2_cntAs = np.full((corepoints.shape[0], len(pi_coords)), np.nan, dtype=np.float64)
+    M3C2_cntBs = np.full((corepoints.shape[0], len(pi_coords)), np.nan, dtype=np.float64)
 
     for cp_idx, p1_neighbours in enumerate(p1_idx):
         if cp_idx % 10 == 9:
@@ -173,6 +171,8 @@ def process_corepoint_list(corepoints, corepoint_normals,
             p1_curr_pts = p1_curr_pts[np.argsort(acrossSq1[:M3C2Meta['maxneigh']])]
             p1_scanPos = p1_scanPos[np.argsort(acrossSq1[:M3C2Meta['maxneigh']])]
         p1_CoG, p1_local_Cxx = get_local_mean_and_Cxx_nocorr(M3C2Meta, p1_curr_pts, p1_scanPos, epoch=0, tf=False) # only one dataset has been transformed
+        along1_var = np.var(along1[np.logical_and(np.abs(along1) <= max_dist, acrossSq1 <= search_radius ** 2)])
+        along1_mean = np.mean(along1[np.logical_and(np.abs(along1) <= max_dist, acrossSq1 <= search_radius ** 2)])
 
 
         for epoch_i, (p2_idx, p2_coords, p2_positions) in enumerate(zip(pi_idx, pi_coords, pi_positions)):  # for every epoch do
@@ -187,7 +187,9 @@ def process_corepoint_list(corepoints, corepoint_normals,
             elif p2_curr_pts.shape[0] > M3C2Meta["maxneigh"]:
                 p2_curr_pts = p2_curr_pts[np.argsort(acrossSq2[:M3C2Meta['maxneigh']])]
                 p2_scanPos = p2_scanPos[np.argsort(acrossSq2[:M3C2Meta['maxneigh']])]
-            p2_CoG, p2_local_Cxx = get_local_mean_and_Cxx_nocorr(M3C2Meta, p2_curr_pts, p2_scanPos, epoch=epoch_i, tf=True)
+            p2_CoG, p2_local_Cxx = get_local_mean_and_Cxx_nocorr(M3C2Meta, p2_curr_pts, p2_scanPos, epoch=epoch_i+1, tf=True)
+            along2_var = np.var(along2[np.logical_and(np.abs(along2) <= max_dist, acrossSq2 <= search_radius ** 2)])
+            along2_mean = np.mean(along2[np.logical_and(np.abs(along2) <= max_dist, acrossSq2 <= search_radius ** 2)])
 
             p1_p2_CoG_Cxx = np.zeros((6, 6))
             p1_p2_CoG_Cxx[0:3, 0:3] = p1_local_Cxx
@@ -197,25 +199,39 @@ def process_corepoint_list(corepoints, corepoint_normals,
             F = np.hstack([-n, n])
             M3C2_unc = np.dot(F, np.dot(p1_p2_CoG_Cxx, F))
 
+            M3C2_threshold = 1.96 * (np.sqrt(along2_var/p2_curr_pts.shape[0] + along1_var/p1_curr_pts.shape[0]) + M3C2Meta['leg_ref_err'])
+            M3C2_dist_leg = along2_mean - along1_mean
+            if np.abs(M3C2_dist_leg) < M3C2_threshold:
+                M3C2_dist_leg = np.nan
+
             M3C2_vals[cp_idx, epoch_i] = M3C2_dist
+            M3C2_vals_sig[cp_idx, epoch_i] = M3C2_dist if np.abs(M3C2_dist) > np.sqrt((p_val * M3C2_unc)) else np.nan
+            M3C2_leg_vals[cp_idx, epoch_i] = M3C2_dist_leg
             M3C2_uncs[cp_idx, epoch_i] = M3C2_unc
+            M3C2_leg_uncs[cp_idx, epoch_i] = (np.sqrt(along2_var/p2_curr_pts.shape[0] + along1_var/p1_curr_pts.shape[0]) + M3C2Meta['leg_ref_err']) ** 2
+            M3C2_cntAs[cp_idx, epoch_i] = p1_curr_pts.shape[0]
+            M3C2_cntBs[cp_idx, epoch_i] =  p2_curr_pts.shape[0]
 
     val_dict = {"val_%s" % dt.timestamp(): M3C2_vals[:, i] for i, dt in enumerate(p_dates[1:])}
     unc_dict = {"unc_%s" % dt.timestamp(): M3C2_uncs[:, i] for i, dt in enumerate(p_dates[1:])}
-    merge_dict = dict()
-    merge_dict.update(val_dict)
-    merge_dict.update(unc_dict)
-    return_dict[idx] = merge_dict
-    pbarQueue.put((0, -1))  # point processing
+    cntA_dict = {"cntA_%s" % dt.timestamp(): M3C2_cntAs[:, i] for i, dt in enumerate(p_dates[1:])}
+    cntB_dict = {"cntB_%s" % dt.timestamp(): M3C2_cntBs[:, i] for i, dt in enumerate(p_dates[1:])}
+    legsigVal_dict = {"legSigVal_%s" % dt.timestamp(): M3C2_leg_vals[:, i] for i, dt in enumerate(p_dates[1:])}
+    legUnc_dict = {"legUnc_%s" % dt.timestamp(): M3C2_leg_uncs[:, i] for i, dt in enumerate(p_dates[1:])}
+    sigVal_dict = {"sigVal_%s" % dt.timestamp(): M3C2_vals_sig[:, i] for i, dt in enumerate(p_dates[1:])}
+    return_dict[idx] = val_dict | unc_dict | cntA_dict | cntB_dict | legsigVal_dict | sigVal_dict | legUnc_dict # merge the dictionaries
+
     for p_shm in pj_shm:
         p_shm.close()
+    pbarQueue.put((0, -1))
 
 def get_local_mean_and_Cxx_nocorr(M3C2Meta, curr_pts, curr_pos, epoch, tf=True):
     nPts = curr_pts.shape[0]
+    # Cll = np.zeros((3*nPts, 3*nPts), dtype=np.float32)
 
     A = np.tile(np.eye(3), (nPts, 1))
     ATP = np.zeros((3, 3 * nPts))
-    tfM = M3C2Meta['tfM'][epoch] if tf else np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])
+    tfM = M3C2Meta['tfM'][epoch-1] if tf else np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])
 
     dx = np.zeros((nPts,), dtype=np.float)
     dy = np.zeros((nPts,), dtype=np.float)
@@ -229,8 +245,9 @@ def get_local_mean_and_Cxx_nocorr(M3C2Meta, curr_pts, curr_pos, epoch, tf=True):
     sigmaYaw = np.zeros((nPts,), dtype=np.float)
     sigmaScan = np.zeros((nPts,), dtype=np.float)
 
+
     for scanPosId in np.unique(curr_pos):
-        scanPos = np.array(M3C2Meta['spInfos'][epoch-1][scanPosId-1]['origin'])
+        scanPos = np.array(M3C2Meta['spInfos'][epoch][scanPosId-1]['origin'])
         scanPosPtsIdx = np.arange(curr_pos.size) # == scanPosId
 
         dd = curr_pts[scanPosPtsIdx, :] - scanPos[np.newaxis, :]
@@ -250,10 +267,10 @@ def get_local_mean_and_Cxx_nocorr(M3C2Meta, curr_pts, curr_pos, epoch, tf=True):
         dz[scanPosPtsIdx] = dr[:, 2]
 
         sigmaRange[scanPosPtsIdx] = np.array(
-            np.sqrt(M3C2Meta['spInfos'][epoch-1][scanPosId-1]['sigma_range']**2 +
-                    M3C2Meta['spInfos'][epoch-1][scanPosId-1]['ppm'] * 1e-6 * rrange[scanPosPtsIdx]**2))  # a + b*d
-        sigmaYaw[scanPosPtsIdx] = np.array(M3C2Meta['spInfos'][epoch-1][scanPosId-1]['sigma_yaw'])
-        sigmaScan[scanPosPtsIdx] = np.array(M3C2Meta['spInfos'][epoch-1][scanPosId-1]['sigma_scan'])
+            np.sqrt(M3C2Meta['spInfos'][epoch][scanPosId-1]['sigma_range']**2 +
+                    M3C2Meta['spInfos'][epoch][scanPosId-1]['ppm'] * 1e-6 * rrange[scanPosPtsIdx]**2))  # a + b*d
+        sigmaYaw[scanPosPtsIdx] = np.array(M3C2Meta['spInfos'][epoch][scanPosId-1]['sigma_yaw'])
+        sigmaScan[scanPosPtsIdx] = np.array(M3C2Meta['spInfos'][epoch][scanPosId-1]['sigma_scan'])
 
     if tf:
         Cxx = M3C2Meta['Cxx'][epoch-1]
@@ -452,17 +469,15 @@ def get_local_mean_and_Cxx_nocorr(M3C2Meta, curr_pts, curr_pos, epoch, tf=True):
     Qxx = np.linalg.inv(N)  # can only have > 0 in main diagonal!
     # pts_m = curr_pts.mean(axis=0)
     l = (curr_pts).flatten(order='c')
-    # l = (curr_pts-pts_m).flatten(order='c')
-    # mean = np.dot(Qxx, np.dot(ATP, l)) + pts_m
     mean = np.dot(Qxx, np.dot(ATP, l))
 
-    return mean, local_Cxx/(nPts)
+    return mean, local_Cxx/(nPts**2)
 
 
 def updatePbar(total, queue, maxProc):
     desc = "Processing core points"
     pCount = 0
-    pbar = tqdm(total=total, ncols=100, desc=desc + " (%02d/%02d Process(es))" % (pCount, maxProc))
+    pbar = tqdm(total=total, ncols=200, desc=desc + " (%02d/%02d Process(es))" % (pCount, maxProc))
     while True:
         inc, process = queue.get()
         pbar.update(inc)
@@ -473,47 +488,71 @@ def updatePbar(total, queue, maxProc):
 
 def main(pi_files, core_point_file, CxxFiles, p_dates, outFile):
 
-    VZ_2000_sigmaRange = 0.005
     VZ_2000_ppm = 0
     VZ_2000_sigmaScan = 0.00027 /4
     VZ_2000_sigmaYaw = 0.00027 /4
 
-    SP1 = {'origin': [0.0, 0.0, 0.0],
-           'sigma_range': VZ_2000_sigmaRange,
-           'sigma_scan': VZ_2000_sigmaScan,
-           'sigma_yaw': VZ_2000_sigmaYaw,
-           'ppm': VZ_2000_ppm}
-
+    SPi_i = []
     Cxx_i = []
     tfM_i = []
     refPointMov_i = []
-    for epoch_id in range(len(pi_files)-1):
 
-        matfile = sio.loadmat(CxxFiles[epoch_id])
-        Cxx = matfile['Cxx']
-        refPointMov = matfile['redPoi']
-        tf = matfile['xhat']
-        tfM = tf_helper.opk2R(tf[0, 0], tf[1,0], tf[2,0])
-        tfM = np.hstack((tfM, np.vstack((tf[3,0], tf[4,0], tf[5,0]))))
-        Cxx = tf_helper.CxxOPK_XYZ2Cxx14(tf[0, 0], tf[1,0], tf[2,0], Cxx)
-        Cxx = np.pad(Cxx, ((0, 6), (0, 6)), mode='constant', constant_values=0)
-        #Cxx = np.zeros(Cxx.shape) #uncomment to ignore coregistration errors
+    # load helmert transformations
+    tf_params = pd.read_csv(r"trans_para_raw.csv")
+    tf_params['time'] = pd.to_datetime(tf_params['time'], format='%Y-%m-%d %H:%M:%S')
+
+    uncertainties = np.loadtxt(r'temporal_mean_uncertainty.csv')
+
+    for date in p_dates:
+        ## find uncertainty:
+        date = date.timestamp()
+        unc = float(uncertainties[uncertainties[:, 0] == date, 1])
+        if np.isnan(unc):
+            unc =  np.nanmax(uncertainties[:, 1])
+        ## create scan position dict
+        SP1 = {'origin': [0.0, 0.0, 0.0],
+               'sigma_range': unc,
+               'sigma_scan': VZ_2000_sigmaScan,
+               'sigma_yaw': VZ_2000_sigmaYaw,
+               'ppm': VZ_2000_ppm}
+
+        SPi_i.append([SP1])
+
+    for epoch_id in range(len(pi_files)-1):
+        ## find transformation parameters
+        closest_tf_loc = np.array([item.total_seconds() for item in (tf_params['time'] - p_dates[epoch_id])])
+        closest_tf_loc[closest_tf_loc > 0] = np.min(closest_tf_loc) - 1
+        closest_tf_loc = np.argmax(closest_tf_loc)
+        print(f'Time difference Ep{epoch_id}: {(tf_params["time"].loc[closest_tf_loc] - p_dates[epoch_id]).total_seconds()/3600:.2f}h')
+        closest_tf = tf_params.loc[closest_tf_loc]
+        tfM = tf_helper.opkM2R(closest_tf['alpha'] * np.pi/200,
+                              closest_tf['beta'] * np.pi/200,
+                              closest_tf['gamma'] * np.pi/200,
+                               1e-6 * closest_tf['ppm']) #  * (1e-6 * closest_tf['ppm'] + 1)
+        tfM = np.hstack((tfM, np.vstack((closest_tf['tx'], closest_tf['ty'], closest_tf['tz']))))
+
+        # load cxx matrix
+        cxx_params = np.loadtxt(rf"transformations\VCM_{closest_tf.time.strftime('%Y_%m_%d_%H_%M_%S')}.csv", delimiter=',')
+        Cxx = tf_helper.CxxOPKM_XYZ2Cxx14(closest_tf['alpha'],closest_tf['beta'],closest_tf['gamma'],
+                                          closest_tf['ppm'] * 1e-6, cxx_params)
+
         Cxx_i.append(Cxx)
         tfM_i.append(tfM)
-        refPointMov_i.append(refPointMov)
+        refPointMov_i.append(np.array([0,0,0]))
+        continue
 
-    M3C2Meta = {'spInfos': [[SP1] * len(pi_files)],
+    M3C2Meta = {'spInfos': SPi_i,
                 'tfM': tfM_i,
                 'Cxx': Cxx_i,
                 'redPoint': refPointMov_i,
-                'searchrad': .5,
+                'searchrad': 0.5,
                 'maxdist': 3,
-                'minneigh': 5,
+                'minneigh': 3,
                 'maxneigh': 100000,
                 'leg_ref_err': 0.02}
 
-    NUM_THREADS = 10
-    NUM_BLOCKS = 60
+    NUM_THREADS = 5
+    NUM_BLOCKS = 70
 
     gettrace = getattr(sys, 'gettrace', None)
     if gettrace is None:
@@ -522,7 +561,7 @@ def main(pi_files, core_point_file, CxxFiles, p_dates, outFile):
         print('Debugging mode detected, running only single thread mode')
         NUM_THREADS = 1
 
-    LEAF_SIZE = 1024 #32
+    LEAF_SIZE = 128 #32
 
     # load file
     print("Loading point clouds")
@@ -532,29 +571,24 @@ def main(pi_files, core_point_file, CxxFiles, p_dates, outFile):
 
     for p_idx, p_file in enumerate(pi_files):
         p_coords, _, p_positions, _, _ = read_from_las(p_file)
-        p_coords, unique_idx = np.unique(p_coords, axis=0, return_index=True)
+        p_coords, unique_idx = np.unique(p_coords, axis=0, return_index=1)
         p_positions = p_positions[unique_idx]
-        p_pickle_file = p_file.replace(".las", "_kd.pickle")
+        p_pickle_file = p_file.replace(".laz", "_kd.pickle")
 
         # build kd tree
         if p_idx > 0: # transform second and subsequent point clouds
             p_coords = p_coords - refPointMov_i[p_idx-1]
             p_coords = np.dot(tfM_i[p_idx-1][:3, :3], p_coords.T).T + tfM_i[p_idx-1][:, 3] + refPointMov_i[p_idx-1]
-        if not os.path.exists(p_pickle_file):
-            print("Building kd-Tree for PC %d" % p_idx)
-            p_kdtree = spatial.KDTree(p_coords, leafsize=LEAF_SIZE)
-            picklebig(p_kdtree, p_pickle_file)
-        else:
-            print("Loading pre-built kd-Tree for PC %d" % p_idx)
-            p_kdtree = unpicklebig(p_pickle_file)
+        p_kdtree = spatial.KDTree(p_coords, leafsize=LEAF_SIZE)
         pi_coords.append(p_coords)
         pi_positions.append(p_positions)
         pi_kdtrees.append(p_kdtree)
 
     # load query points
     query_coords, query_norms, _, _, _ = read_from_las(core_point_file)
+    np.random.seed(12345)
     idx_randomized = np.arange(query_coords.shape[0])
-    np.random.shuffle(idx_randomized)
+    #np.random.shuffle(idx_randomized)
     query_coords = query_coords[idx_randomized, :]
     query_norms = query_norms[idx_randomized, :]
 
@@ -566,6 +600,8 @@ def main(pi_files, core_point_file, CxxFiles, p_dates, outFile):
         sub_idx = np.random.choice(np.arange(0, query_coords.shape[0]), 1000)
         query_coords = query_coords[sub_idx]
         query_norms = query_norms[sub_idx]
+    query_coords = query_coords[::1]
+    query_norms = query_norms[::1]
     query_coords_subs = np.array_split(query_coords, NUM_BLOCKS)
     query_norms_subs = np.array_split(query_norms, NUM_BLOCKS)
     print("Total: %d core points" % (query_coords.shape[0]))
@@ -641,39 +677,42 @@ def main(pi_files, core_point_file, CxxFiles, p_dates, outFile):
             curr_len = return_dict[i][key].shape[0]
             out_attrs[key][curr_start:curr_start + curr_len] = return_dict[i][key]
             curr_start += curr_len
-    out_attrs['normals'] = query_norms
-    # Backup saving strategies are commented out
-    # picklebig(query_coords, outFile + ".coords.pickle")
-    # picklebig(out_attrs, outFile + ".pickle")
-    # np.save(outFile + ".coords.npy", query_coords)
-    # np.save(outFile + ".npy", out_attrs)
+    out_attrs['NormalX'] = query_norms[:, 0]
+    out_attrs['NormalY'] = query_norms[:, 1]
+    out_attrs['NormalZ'] = query_norms[:, 2]
     write_to_las(outFile, query_coords, out_attrs)
 
 
 if __name__ == '__main__':
     import glob
+    from pathlib import Path
 
     tbegin = time.time()
-    tiles_pre = list(glob.glob(r"pointclouds_gnd\*_gnd.las"))
+
+    tiles_pre = list(glob.glob(r"input_ground_points\*.laz"))
     tiles_pre = sorted(tiles_pre)
-    step = 20
+
+    #tiles_pre = [tiles_pre[0]] + tiles_pre[1:110]  # total: 764
+    step = 10
     for chunk in range(len(tiles_pre)//step + 1):
         print("Running for Epochs %s - %s (Chunk %s/%s)" % (1+chunk*step,(chunk+1)*step, chunk+1, len(tiles_pre)//step + 1))
+        #continue
         tiles_curr = [tiles_pre[0]] + tiles_pre[1+chunk*step:1+(chunk+1)*step]
         if len(tiles_curr) == 1:
             print("Empty chunk.")
             break
-        outFile = r"change_full_info_%02d.las" % chunk
-        CxxFiles = [r"trafos\vals_" + ep.replace("_gnd.las", r"\Cxx.mat").replace(r"pointclouds_gnd\ScanPos001 - SINGLESCANS - ", "") for ep in tiles_curr[1:]]  # first one does not have any CXX
-        p_dates = [datetime.strptime(ep.replace("_gnd.las","")[-13:],'%y%m%d_%H%M%S') for ep in tiles_curr]
-        print("Reference Epoch (needed in follow-up scripts): %s" % p_dates[0].timestamp())
+        outFile = r"m3c2-ep_results\vals2021_m3c2ep_%02d.las" % chunk
+        #tiles_pre = [tiles_pre[0]] + tiles_pre[380:]
+        #p_dates = [datetime.strptime(ep.replace(".laz", "")[-13:], '%y%m%d_%H%M%S') for ep in tiles_curr]
+        p_dates = [datetime.strptime(ep.replace(".las", "")[-13:], '%y%m%d_%H%M%S') for ep in tiles_curr]
         tstart = time.time()
         pi_files = tiles_curr
-        core_point_file =r"corepoints_with_normals.las"
+        core_point_file =r"corepoints.las"
         if os.path.exists(outFile):
             print("Skipping chunk because outFile exists!")
             continue
-        main(pi_files, core_point_file, CxxFiles, p_dates, outFile)
+        main(pi_files, core_point_file, [], p_dates, outFile)
         tend = time.time()
         print("== > Finished chunk (Took %.3f s)." % ((tend - tstart)))
     print("Finished all chunks.")
+    print("Reference Epoch (needed in follow-up scripts): %s" % p_dates[0].timestamp())
