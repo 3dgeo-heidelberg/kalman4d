@@ -1,6 +1,6 @@
 import glob
 import time
-from pathlib import Path
+
 import tqdm
 from filterpy.kalman import KalmanFilter as kf
 from filterpy.common import Q_discrete_white_noise
@@ -12,9 +12,6 @@ import matplotlib.pyplot as plt
 import laspy
 
 import multiprocessing
-
-global outfile
-outfile = ''
 
 def limited_cumsum(array, lb=0):
     result = np.zeros(array.size)
@@ -51,10 +48,10 @@ def read_from_las(path, useevery=1):
     leguncs = np.full((coords.shape[0], date_count), np.nan)
     dates = []
     dateidx = 0
-    for las_field in las_fields:
+    for las_field in sorted(las_fields):
         if las_field.startswith("val_"):
             field_date = las_field[4:]
-            date = datetime.fromtimestamp(int(float(field_date)))
+            date = float(field_date)
             dates.append(date)
             vals[:, dateidx] = inFile.points.array["val_%s" % field_date][::useevery]
             uncs[:, dateidx] = inFile.points.array["unc_%s" % field_date][::useevery]
@@ -114,14 +111,10 @@ def proc_cp(p_changes, p_unc, p_dates, corepoint_id, p_val, mkplot, Q_vals, expo
                  p_changes]  # "nan" breaks processing, None means no observation here
     p_unc = [item if not np.isnan(item) else None for item in p_unc]
 
-    # my_filter.rot = 0.1  # Measurement noise matrix
-    # my_filter.Q = Q_discrete_white_noise(2, 1, .05)  # process uncertainty
-
-    ts_raw = np.array([datetime2year(date) * 365 for date in p_dates])  # time series in days
+    ts_raw = np.array(p_dates) / 3600. # time series in days
     ts_raw -= ts_raw[0]
 
-    interval = 1./24  # (evaluation interval in days, e.g. 1/12 = 2 hours)
-    ts_full = np.arange(ts_raw[0], ts_raw[-1], interval)  # define here range and interval
+    ts_full = np.arange(ts_raw[0], ts_raw[-1], 1)
 
     ts_nones = np.array([None] * len(ts_full))
     ts = np.concatenate((ts_raw, ts_full))
@@ -164,19 +157,13 @@ def proc_cp(p_changes, p_unc, p_dates, corepoint_id, p_val, mkplot, Q_vals, expo
             Qs = [q ** 2 for dt in dts]
 
         (mu, cov, _, _) = my_filter.batch_filter(zs, Fs=Fs, Rs=Rs, Qs=Qs)
-        # print(len(mu), len(cov), len(Fs))
         (xs, Ps, Ks, Pp) = my_filter.rts_smoother(mu, cov, Fs=Fs, Qs=Qs)
 
         res = np.array([zi - xi for (zi, xi) in zip(zs, xs) if (zi is not None and xi is not None)])
-        # res_t = np.array([ti for (ti, zi, xi) in zip(ts, zs, xs) if (zi is not None and xi is not None)])
-        # res_unc = [u for u in p_unc_raw[1:] if u is not None]
         res = res[:, 0]  # only position residuals
-        # cusum = limited_cumsum(res)
         norm_res = res ** 2  # / res_unc
         SqSumRes[q_id] = np.nansum(norm_res)
-        # MaxAbsRes = np.nanmax(np.abs(res))
 
-        # SqSumResS[corepoint_id, q_id] = SqSumRes
         if q_id + 1 == len(Q_vals) or True:  # only for the last q
             smoother_unc = np.array([(p_val * elem[0, 0]) ** (0.5) for elem in Ps])
             if dim >= 2:
@@ -210,7 +197,6 @@ def proc_cp(p_changes, p_unc, p_dates, corepoint_id, p_val, mkplot, Q_vals, expo
             filterVals = [ts[interp_idx], smoother_val[interp_idx[1:]], smoother_unc[interp_idx[1:]]]
 
             if corepoint_id % 1000 == 0 and False:
-                #print("Plotting point #%d" % corepoint_id)
                 plt.figure(figsize=(24, 10))
                 plt.plot(ts[1:], zs, "rx", label="Measurement")
                 plt.plot(ts[1:], mu[:, 0], "b--", label="Kalman filter state")
@@ -225,12 +211,12 @@ def proc_cp(p_changes, p_unc, p_dates, corepoint_id, p_val, mkplot, Q_vals, expo
                          "r.")
                 plt.xlabel("Epoch")
                 plt.ylabel("Change [m]")
-                plt.ylim([-0.2, 0.2])
+                plt.ylim([-0.1, 0.1])
                 plt.title("Change detection ($\sigma$ = %f)" % q)
                 plt.tight_layout()
                 plt.legend()
 
-                plt.savefig(str(Path(outfile_q).parent / ('kalman_plot_d%s_%s_q%s.svg' % (dim, corepoint_id, q))))
+                plt.savefig('kalman_plot_d%s_%s_q%s.svg' % (dim, corepoint_id, q))
                 plt.close()
 
     return (SqSumRes, sign_date,
@@ -270,24 +256,29 @@ def main(infile, ref_epoch, Q_vals, outFile, useevery=1, mkplot=None, exportFilt
         assert np.allclose(coords, coords_i[inverse_ids, :])
         p_dates = p_dates + p_dates_i
 
-    valid_dates = np.array(p_dates) < datetime.fromtimestamp(9999999999)
-    p_dates = [p_date for idx, p_date in enumerate(p_dates) if valid_dates[idx]]
+    valid_dates = np.ones_like(p_dates).astype(bool)
+
+    p_dates = np.array([p_date for idx, p_date in enumerate(p_dates) if valid_dates[idx]])
     changes = changes[:, valid_dates]
     unc = unc[:, valid_dates]
 
+    order = np.argsort(p_dates)
+    p_dates = p_dates[order]
+    changes = changes[:, order]
+    unc = unc[:, order]
 
-    p_dates = [datetime.fromtimestamp(int(float(ref_epoch)))] + p_dates
+    p_dates = np.concatenate([[float(ref_epoch)], p_dates])
     print(p_dates)
 
-    p = 3  # three-dimensional, projected to 1D
+
+    p = 3  # three-dimensional
     p_val = sstats.chi2.ppf(.95, p)
 
     process_corepoints = range(coords.shape[0])
-
     for q in Q_vals:
         pool = multiprocessing.Pool(10)
         ts = time.time()
-        outfile_q = outfile.format(q=q)
+        outfile_q = outfile
         results = pool.starmap(proc_cp, tqdm.tqdm([[changes[corepoint_id, :], unc[corepoint_id, :],
                                                     p_dates, corepoint_id, p_val, mkplot, [q], exportFilter, exportFreshD, dim, outfile_q] for corepoint_id in process_corepoints]),
                                chunksize=1)
@@ -354,8 +345,8 @@ def main(infile, ref_epoch, Q_vals, outFile, useevery=1, mkplot=None, exportFilt
 
             sig_dates = np.array(p_dates[1:])[np.abs(changes[ptid, :]) >= (1.96 * np.sqrt((leguncs[ptid, :])))]
             percLeg[ptid] = len(sig_dates) / (len(p_dates)-1)
-            dateLeg[ptid] =  datetime2year(np.min(sig_dates)) * 365 if len(sig_dates) > 0 else np.nan
-        dateLeg -= datetime2year(p_dates[0]) * 365
+            dateLeg[ptid] =  np.min(sig_dates) if len(sig_dates) > 0 else np.nan
+        dateLeg -= p_dates[0]
 
         out_attrs = {}
         out_attrs['NormalX'] = normals[process_corepoints, 0]
@@ -399,7 +390,6 @@ def main(infile, ref_epoch, Q_vals, outFile, useevery=1, mkplot=None, exportFilt
                     fresh_elements[pix][kix+3] = val
             np.save(outfile_q.replace(".las", "_fresh.npy"), fresh_elements)
 
-
         min_q_idx = np.argmin(SqSumResS, axis=1)
         out_attrs['min_res_q_magn'] = SqSumResS[np.arange(len(min_q_idx)), min_q_idx]
         out_attrs['date'] = SignDates
@@ -428,20 +418,23 @@ def main(infile, ref_epoch, Q_vals, outFile, useevery=1, mkplot=None, exportFilt
         out_attrs['percLeg'] = percLeg
         out_attrs['percSig'] = percSig
 
-
-
         write_to_las(outfile_q, coords[process_corepoints, :], out_attrs)
 
-
 if __name__ == '__main__':
-    infile = glob.glob(r"m3c2-ep-results\*.las")
-    ref_epoch = 1629226820.0   # unix timestamp of the zero epoch (VALS 2021)
-    Q_vals = [[0.0005]]
-    dims = [1]
-    names = ['X']
+    infile = glob.glob(r"synth_m3c2\*.las")
+    ref_epoch = 0
 
-    for Qs, dim, name in zip(Q_vals, dims, names):
-        outfile = r"kalman-results\q{{q}}.las".format(name=name)
-        main(infile, ref_epoch, Qs, outfile, useevery=1,
-             mkplot=[1],
-             exportFilter=True, exportFreshD=False, dim=dim)
+    for dim, name, Q_vals in zip(
+        [1,2,3],
+        ['X', 'XV', 'XVA'],
+        [
+            [0.0005, 0.002, 0.005],
+            [0.0002],
+            [0.00002, 0.00001, 0.000005]
+        ]
+    ):
+        for q in Q_vals:
+            outfile = rf"synth_kalman\kalman_{name}_q{q}.las"
+            main(infile, ref_epoch, [q], outfile, useevery=1,
+                 mkplot=[1],
+                 exportFilter=True, exportFreshD=False, dim=dim)

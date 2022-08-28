@@ -19,7 +19,7 @@ The following packages:
 
 The ICPmat2CxxMat.exe is a MatLAB executable to transfer the covariance information created by OPALS ICP (https://opals.geo.tuwien.ac.at/html/stable/ModuleICP.html) to a .mat-File that is readable by python/numpy.
 
-The tf_helper.py is a script to transform a 6x6 covariance matrix (rigid Helmert-Transform with fixed scale) to a full 12x12 covariance matrix as required by M3C2-EP.
+The tf_helper_T.py is a script to transform a 6x6 covariance matrix (rigid Helmert-Transform with fixed scale) to a full 12x12 covariance matrix as required by M3C2-EP. It follows the nomenclature given in the formula collecton of Joeckel, R., Gruber, F. J. (2020). Formelsammlung für das Vermessungswesen. Germany: Springer Fachmedien Wiesbaden.
 
 apply_filter.bat is a batch file applying the ground point filter used in pre-preparation of the data. It relies on PDAL.
 
@@ -49,66 +49,14 @@ ref_epoch is the UNIX timestamp of the reference epoch (written to stdout by mul
 Q_vals is a list of sigma values for the discrete white noise used to model state covariance
 outfile is the output point cloud. Note that if too many epochs are exported, laspy will fail to write.
 
-3) kalman_cluster.py
-This script is used to take the attributes exported by kalman_m3c2.py and apply a clustering method. Again, inputs/outputs
-and the parameters to be used for clustering are defined at the end of the file.
-
-4) GME_on_numpy.py
-As the number of parameters extracted with tsfresh is too large for a las-File, we export them to a .npy file. This script does the
-same as kalman_cluster.py but takes a numpy file as input instead. The las-File is still required for the coordinates.
-
-5) kmeans_cluster.py
+3) kmeans_cluster.py
 This script takes the smoothed change values themselves and uses them for clustering. Again, input/output/options are at the end of the file.
 
-The workflow looks like this:
+4) kromer_m3c2.py
+This script runs on the same inputs as kalman_m3c2.py, but implements temporal median smoothing or linear interpolation. The output can be changed in Line 115/116.
 
-                        ┌────────────────┐
-                      ┌─┴───────────────┐│
-                      │                 ││       ┌────────────────────────┐
-                      │   epoch-wise    ││       │                        │
-                      │   point clouds  ││ ────► │ 1)multitemp_change.py  │
-                      │   & trafos      ││       │                        │
-                      │                 ├┘       │                        │
-                      └─────────────────┘        └───────────┬────────────┘
-                                                             │
-                                                 ┌───────────▼────────────┐
-                                                 │                        │
-                                                 │  point cloud with      │
-                                                 │   change per epoch     │
-                                                 │                        │
-                                                 └───────────┬────────────┘
-                                                             │
-                                                 ┌───────────▼────────────┐
-                                                 │                        │
-                                                 │2 ) kalman_m3c2.py      │
-                                                 │                        │
-                                                 │                        │
-                                                 └──┬────┬────────────────┘
-                                                    │    │
-                                 ┌──────────────────┘    │
-                                 ▼                       ▼
-                         ┌─────────────────┐         ┌─────────────────┐
-                         │                 │         │                 │
-                         │ point cloud     │         │ .npy file with  │
-                         │ with smoothed   │         │ additional      │
-                         │ timeseries      │         │ features        │
-                         │                 │         │                 │
-                         └──┬─────────┬────┴──────┐  └────────┬────────┘
-                            │         │           └──────┐    │
-         ┌──────────────────▼┐  ┌─────▼─────────────┐  ┌─▼────▼────────────┐
-         │                   │  │                   │  │                   │
-         │                   │  │                   │  │                   │
-         │3)kalman_cluster.py│  │4)GME_on_numpy.py  │  │5)kmeans_cluster.py│
-         │                   │  │                   │  │                   │
-         │                   │  │                   │  │                   │
-         └───────────┬───────┘  └───────┬───────────┘  └────┬──────────────┘
-                     │                  │                   │
-                     │                  │                   │
-                     │                  │                   │
-                     └───────►┌─────────▼──────┐◄───────────┘
-                              │                │
-                              │ cluster result │
-                              │                │
-                              └────────────────┘
+5) Any script with 'plot' is used to recreate the figures in the manuscript.
 
-
+7) For the synthetic example, the HELIOS++ Software is required: https://github.com/3dgeo-heidelberg/helios/releases/tag/v1.1.0
+Then, synth_change.py will create a point cloud time series, which can be used for M3C2-EP using multitemp_change_synth.py, and then processed in the kalman filter with kalman_m3c2_synth.py.
+Similarly, linear interpolation or temporal median filtering can be carried out with synth_kromer_m3c2.py. Results are then quantified with kalman_synth_residuals.py and plotted with plot_kalman_qchoice_synth.py.
